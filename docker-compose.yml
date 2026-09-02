@@ -1,0 +1,122 @@
+# ---------------------------------------------------------------------------
+# Exactly five services. Only `web` publishes a port; db, redis, migrate and
+# worker stay on the private compose network.
+#
+#   db      PostgreSQL
+#   redis   Redis for BullMQ
+#   migrate one-shot: wait for db -> prisma migrate deploy -> seed -> exit
+#   web     Next.js (public)
+#   worker  BullMQ consumer + watchdog (private)
+#
+# AI provider and Resend credentials are NEVER configured here — they live
+# encrypted in PostgreSQL and are managed through the admin panel.
+# ---------------------------------------------------------------------------
+
+name: ai-notetaker
+
+x-app-env: &app-env
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+  APP_SECRET: ${APP_SECRET}
+  APP_URL: ${APP_URL}
+  ADMIN_EMAIL: ${ADMIN_EMAIL}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+  MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-104857600}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-notetaker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notetaker}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_notetaker}
+    volumes:
+      - ai-notetaker-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-notetaker} -d ${POSTGRES_DB:-ai_notetaker}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - ai-notetaker-redis:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [internal]
+
+  # One-shot. Never runs from web or worker startup; `prisma db push` is unused.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-notetaker:local
+    command: ['sh', 'scripts/migrate.sh']
+    environment:
+      <<: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: 'no'
+    networks: [internal]
+
+  web:
+    image: ai-notetaker:local
+    command: ['npx', 'next', 'start', '-p', '3000', '-H', '0.0.0.0']
+    environment:
+      <<: *app-env
+      NODE_ENV: production
+    ports:
+      - '${WEB_PORT:-3000}:3000'
+    volumes:
+      - ai-notetaker-shared:/app/data/shared
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:3000/api/health']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [internal]
+
+  worker:
+    image: ai-notetaker:local
+    command: ['npm', 'run', 'worker']
+    environment:
+      <<: *app-env
+      NODE_ENV: production
+    volumes:
+      - ai-notetaker-shared:/app/data/shared
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [internal]
+
+volumes:
+  ai-notetaker-db:
+  ai-notetaker-redis:
+  # Mounted identically at /app/data/shared for web and worker.
+  ai-notetaker-shared:
+
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,9 @@
+{
+  "name": "AI Notetaker",
+  "short_name": "Notetaker",
+  "description": "Meeting audio to transcript, summary, action items and mind map.",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#f9fafb",
+  "theme_color": "#4f46e5"
+}

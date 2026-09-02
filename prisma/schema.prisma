@@ -1,0 +1,385 @@
+// ---------------------------------------------------------------------------
+// F2 — Database & Prisma Contract
+//
+// Rules honoured here:
+//  * PostgreSQL + Prisma
+//  * UUID primary keys
+//  * UTC DateTime (Prisma maps DateTime to `timestamp(3)` and always reads and
+//    writes it as UTC; no naive local time is ever stored)
+//  * Invariant: Job.userId MUST equal Note.userId. This is enforced by the
+//    database itself via the composite key ([id, userId]) on Note and the
+//    composite foreign key on Job — not only in application code.
+//  * No plaintext credentials: AIProviderConfig.apiKey and ResendConfig.apiKey
+//    store ciphertext produced with APP_SECRET (see lib/crypto.ts).
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum AuthTokenType {
+  MAGIC_LINK
+  OTP
+}
+
+enum NoteStatus {
+  UPLOADED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum JobStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum JobStage {
+  QUEUED
+  TRANSCRIPTION
+  SUMMARY
+  ACTION_ITEMS
+  MIND_MAP
+  COMPLETED
+}
+
+enum ProviderRole {
+  TRANSCRIPTION
+  TEXT
+}
+
+enum AIProviderType {
+  OPENAI
+  GROQ
+  GOOGLE
+  ANTHROPIC
+  OPENAI_COMPATIBLE
+}
+
+enum EmailType {
+  MAGIC_LINK
+  OTP
+  RESULT
+  FAILURE
+  TEST
+}
+
+enum EmailStatus {
+  SENT
+  FAILED
+  SKIPPED
+}
+
+// ---------------------------------------------------------------------------
+// Users, sessions and authentication tokens
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  email     String   @unique 
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions   UserSession[]
+  authTokens AuthToken[]
+  notes      Note[]
+  jobs       Job[]
+  usageLogs  UsageLog[]
+  emailLogs  EmailLog[]
+}
+
+/// Session token itself is NEVER stored — only its SHA-256 hash.
+model UserSession {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// Single-use, finite-TTL magic links and 6-digit OTPs.
+/// `tokenHash` holds the hash of the magic-link token; `otpHash` holds the hash
+/// of the 6-digit code. `usedAt != null` means the credential is spent and can
+/// never be replayed.
+model AuthToken {
+  id        String        @id @default(uuid()) @db.Uuid
+  userId    String        @db.Uuid
+  type      AuthTokenType
+  tokenHash String?
+  otpHash   String?
+  attempts  Int           @default(0)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+}
+
+model Admin {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique 
+  /// Argon2id hash. Never a plaintext password, never reversible.
+  passwordHash String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions AdminSession[]
+}
+
+/// Admin sessions are a separate table from user sessions and use a separate
+/// cookie, so a user session can never satisfy an admin check and vice versa.
+model AdminSession {
+  id        String    @id @default(uuid()) @db.Uuid
+  adminId   String    @db.Uuid
+  tokenHash String    @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  admin Admin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notes, jobs and AI results
+// ---------------------------------------------------------------------------
+
+model Note {
+  id             String     @id @default(uuid()) @db.Uuid
+  userId         String     @db.Uuid
+  title          String
+  /// Server-generated path, never a client-supplied one.
+  sourcePath     String     @unique
+  originalName   String
+  mimeType       String
+  fileSizeBytes  Int
+  status         NoteStatus @default(UPLOADED)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs        Job[]
+  transcript  Transcript?
+  summary     Summary?
+  actionItems ActionItem[]
+  mindMap     MindMap?
+
+  /// Composite key backing the Job.userId == Note.userId invariant.
+  @@unique([id, userId])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model Job {
+  id     String    @id @default(uuid()) @db.Uuid
+  noteId String    @db.Uuid
+  userId String    @db.Uuid
+  status JobStatus @default(QUEUED)
+  stage  JobStage  @default(QUEUED)
+  /// 0..100. QUEUED=0, TRANSCRIPTION=10..35, SUMMARY=35..60,
+  /// ACTION_ITEMS=60..80, MIND_MAP=80..95, COMPLETED=100.
+  progress         Int       @default(0)
+  /// Actual provider that produced the result (may differ from the primary).
+  providerUsed     String?
+  modelUsed        String?
+  errorCode        String?
+  errorMessage     String?
+  /// BullMQ retry attempts consumed.
+  attempts         Int       @default(0)
+  /// Watchdog recoveries consumed. Capped at 3.
+  watchdogRequeues Int       @default(0)
+  lastHeartbeatAt  DateTime?
+  queuedAt         DateTime  @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+  failedAt         DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // Composite FK: guarantees Job.userId is the owner of the Note.
+  note Note @relation(fields: [noteId, userId], references: [id, userId], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  usageLog UsageLog?
+
+  /// One job per note — duplicate-enqueue protection at the database level.
+  @@unique([noteId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, lastHeartbeatAt])
+}
+
+model Transcript {
+  id        String   @id @default(uuid()) @db.Uuid
+  noteId    String   @unique @db.Uuid
+  jobId     String   @db.Uuid
+  provider  String
+  model     String
+  language  String?
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+
+  note Note @relation(fields: [noteId], references: [id], onDelete: Cascade)
+}
+
+model Summary {
+  id        String   @id @default(uuid()) @db.Uuid
+  noteId    String   @unique @db.Uuid
+  jobId     String   @db.Uuid
+  provider  String
+  model     String
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+
+  note Note @relation(fields: [noteId], references: [id], onDelete: Cascade)
+}
+
+model ActionItem {
+  id        String   @id @default(uuid()) @db.Uuid
+  noteId    String   @db.Uuid
+  jobId     String   @db.Uuid
+  content   String
+  assignee  String?
+  dueDate   String?
+  completed Boolean  @default(false)
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  note Note @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  @@index([noteId, position])
+}
+
+model MindMap {
+  id        String   @id @default(uuid()) @db.Uuid
+  noteId    String   @unique @db.Uuid
+  jobId     String   @db.Uuid
+  provider  String
+  model     String
+  /// Markdown outline rendered client-side by Markmap.
+  markdown  String   @db.Text
+  createdAt DateTime @default(now())
+
+  note Note @relation(fields: [noteId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Configuration (credentials live here, encrypted — never in env vars)
+// ---------------------------------------------------------------------------
+
+model AIProviderConfig {
+  id             String         @id @default(uuid()) @db.Uuid
+  role           ProviderRole
+  name           String
+  provider       AIProviderType
+  /// Optional override; defaults per provider type.
+  baseUrl        String?
+  /// Ciphertext (AES-256-GCM) produced with APP_SECRET. Never plaintext.
+  apiKeyEncrypted String
+  model          String
+  isPrimary      Boolean        @default(false)
+  /// Lower runs first within a role.
+  priority       Int            @default(100)
+  isActive       Boolean        @default(true)
+  timeoutMs      Int            @default(60000)
+  lastTestedAt   DateTime?
+  lastTestOk     Boolean?
+  lastTestError  String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@unique([role, name])
+  @@index([role, isActive, priority])
+}
+
+model ResendConfig {
+  id                String    @id @default(uuid()) @db.Uuid
+  /// Ciphertext (AES-256-GCM) produced with APP_SECRET. Never plaintext.
+  apiKeyEncrypted   String
+  fromEmail         String
+  fromName          String?
+  replyTo           String?
+  isActive          Boolean   @default(true)
+  lastTestedAt      DateTime?
+  lastTestOk        Boolean?
+  lastTestError     String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Usage and email observability
+// ---------------------------------------------------------------------------
+
+/// Created ONLY for successful jobs. jobId is unique so usage can never be
+/// double-counted by a retry or a watchdog requeue.
+model UsageLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  jobId           String   @unique @db.Uuid
+  noteId          String   @db.Uuid
+  userId          String   @db.Uuid
+  provider        String
+  model           String
+  audioSeconds    Int?
+  promptTokens    Int?
+  completionTokens Int?
+  totalTokens     Int?
+  /// V1 uses estimated cost (see lib/usage/estimate.ts).
+  estimatedCost   Decimal  @default(0) @db.Decimal(14, 6)
+  currency        String   @default("USD")
+  breakdown       Json?
+  createdAt       DateTime @default(now())
+
+  job  Job  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+}
+
+model EmailLog {
+  id             String      @id @default(uuid()) @db.Uuid
+  type           EmailType
+  status         EmailStatus
+  to             String
+  subject        String?
+  /// Stable key so a repeated side effect is recorded once.
+  idempotencyKey String      @unique
+  userId         String?     @db.Uuid
+  jobId          String?     @db.Uuid
+  messageId      String?
+  error          String?
+  createdAt      DateTime    @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([type, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+}

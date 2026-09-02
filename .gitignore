@@ -1,0 +1,40 @@
+# dependencies
+node_modules
+npm-debug.log*
+yarn-error.log*
+
+# next.js
+.next
+next-env.d.ts
+out
+
+# builds
+dist
+*.tsbuildinfo
+
+# test / coverage
+coverage
+.vitest
+tests/.tmp
+*.lcov
+
+# environment
+.env
+.env.*
+!.env.example
+
+# local data (audio + AI output live here at runtime)
+data
+/app/data
+
+# prisma
+prisma/dev.db*
+
+# editor / os
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# local dev databases created by embedded-postgres during tests
+.pg-test
