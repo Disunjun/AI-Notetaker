@@ -1,0 +1,16 @@
+node_modules
+.next
+.git
+.gitignore
+npm-debug.log*
+coverage
+.vitest
+tests
+tests/.tmp
+.pg-test
+data
+*.md
+Dockerfile
+docker-compose.yml
+.env
+.env.*
